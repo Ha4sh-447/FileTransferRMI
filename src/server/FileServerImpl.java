@@ -14,6 +14,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.*;
+import java.net.*;
+import com.sun.net.httpserver.*;
+import java.util.concurrent.Executors;
 
 /**
  * Core server implementation of the Distributed File Transfer System using Java
@@ -36,6 +39,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
     private final String storageDir;
     private final ConcurrentHashMap<String, FileMetadata> fileMetadataMap;
     private final ConcurrentHashMap<String, ReentrantLock> fileLocks;
+    private final ConcurrentHashMap<String, byte[][]> activeTransfers; // fileName -> [chunkIndex][data]
     private final ReplyCache replyCache;
     private final AccessLogger logger;
 
@@ -53,6 +57,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
         this.storageDir = storageDir;
         this.fileMetadataMap = new ConcurrentHashMap<>();
         this.fileLocks = new ConcurrentHashMap<>();
+        this.activeTransfers = new ConcurrentHashMap<>();
         this.replyCache = new ReplyCache(REPLY_CACHE_SIZE);
         this.logger = new AccessLogger(serverName, logDir);
 
@@ -70,9 +75,130 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
     }
 
     /**
-     * Scan the storage directory and rebuild the metadata map.
-     * This supports fault-tolerance — server can recover state after restart.
+     * Start auxiliary benchmarking services on derivative ports.
      */
+    public void startAuxiliaryServices(int basePort) {
+        // 1. Raw Socket RPC (Base + 1)
+        new Thread(() -> startRawSocketServer(basePort + 1)).start();
+
+        // 2. Pseudo-gRPC / HTTP (Base + 2)
+        new Thread(() -> startHttpServer(basePort + 2)).start();
+
+        // 3. Legacy / CORBA Simulation (Base + 3)
+        new Thread(() -> startLegacySocketServer(basePort + 3)).start();
+    }
+
+    private void startRawSocketServer(int port) {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            while (true) {
+                try (Socket clientSocket = serverSocket.accept();
+                        ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+                        ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream())) {
+                    Object obj = in.readObject(); // Read data or PING
+                    out.writeObject("DONE");
+                    out.flush();
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Raw Socket Server failed: " + e.getMessage());
+        }
+    }
+
+    private void startHttpServer(int port) {
+        try {
+            HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+            server.createContext("/ping", exchange -> {
+                if ("POST".equals(exchange.getRequestMethod())) {
+                    exchange.getRequestBody().readAllBytes(); // Read payload
+                }
+                String response = "DONE";
+                exchange.sendResponseHeaders(200, response.length());
+                OutputStream os = exchange.getResponseBody();
+                os.write(response.getBytes());
+                os.close();
+            });
+            server.setExecutor(null);
+            server.start();
+        } catch (IOException e) {
+            System.err.println("HTTP Server failed: " + e.getMessage());
+        }
+    }
+
+    private void startLegacySocketServer(int port) {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            while (true) {
+                try (Socket clientSocket = serverSocket.accept();
+                        ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+                        ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream())) {
+                    Object data = in.readObject();
+                    // Simulate heavy 90s CORBA serialization overhead
+                    if (data instanceof byte[]) {
+                        Thread.sleep(((byte[]) data).length / 10240 + 5);
+                    } else {
+                        Thread.sleep(10);
+                    }
+                    out.writeObject("DONE");
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Legacy Socket Server failed: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public TransferResult uploadChunk(String fileName, int chunkIndex, int totalChunks, byte[] data, String checksum)
+            throws RemoteException {
+        // Validate chunk integrity
+        if (!computeChecksum(data).equals(checksum)) {
+            return new TransferResult(false, "Chunk " + chunkIndex + " checksum mismatch.");
+        }
+
+        byte[][] chunks = activeTransfers.computeIfAbsent(fileName, k -> new byte[totalChunks][]);
+        chunks[chunkIndex] = data;
+
+        // Check if all chunks present
+        boolean complete = true;
+        int receivedSize = 0;
+        for (byte[] c : chunks) {
+            if (c == null) {
+                complete = false;
+            } else {
+                receivedSize += c.length;
+            }
+        }
+
+        if (complete) {
+            ReentrantLock lock = getLock(fileName);
+            lock.lock();
+            try {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream(receivedSize);
+                for (byte[] c : chunks)
+                    baos.write(c);
+                byte[] fullData = baos.toByteArray();
+
+                String fullChecksum = computeChecksum(fullData);
+                Path filePath = Paths.get(storageDir, fileName);
+                Files.write(filePath, fullData);
+
+                FileMetadata meta = new FileMetadata(fileName, fullData.length, fullChecksum,
+                        System.currentTimeMillis(), System.currentTimeMillis());
+                fileMetadataMap.put(fileName, meta);
+                activeTransfers.remove(fileName);
+                replyCache.invalidateAll();
+
+                return new TransferResult(true, "Combined " + totalChunks + " chunks into " + fileName, fullChecksum);
+            } catch (IOException e) {
+                return new TransferResult(false, "Failed to merge chunks: " + e.getMessage());
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        return new TransferResult(true, "Chunk " + chunkIndex + " received.");
+    }
+
     private void loadExistingFiles() {
         File dir = new File(storageDir);
         File[] files = dir.listFiles();
@@ -406,6 +532,9 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
 
             // Create server instance
             FileServerImpl server = new FileServerImpl(serverName, storageDir, logDir);
+
+            // Start auxiliary benchmarking services (Raw RPC, HTTP, Legacy)
+            server.startAuxiliaryServices(port);
 
             // Bind to local registry
             String bindName = "FileTransferService_" + serverName;

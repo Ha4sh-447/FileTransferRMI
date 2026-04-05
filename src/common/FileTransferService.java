@@ -21,12 +21,25 @@ public interface FileTransferService extends Remote {
      * Data should be GZIP-compressed before sending to reduce bandwidth.
      * Idempotent: re-uploading the same file overwrites the previous version.
      *
-     * @param fileName     Name of the file to store
+     * @param fileName       Name of the file to store
      * @param compressedData GZIP-compressed file content
-     * @param checksum     SHA-256 checksum of the ORIGINAL (uncompressed) data
+     * @param checksum       SHA-256 checksum of the ORIGINAL (uncompressed) data
      * @return TransferResult with success status and server-computed checksum
      */
     TransferResult uploadFile(String fileName, byte[] compressedData, String checksum)
+            throws RemoteException;
+
+    /**
+     * Upload a specific chunk of a file.
+     * 
+     * @param fileName    Target filename
+     * @param chunkIndex  Zero-based index of this chunk
+     * @param totalChunks Total number of chunks expected
+     * @param data        Chunk data
+     * @param checksum    Checksum of this SPECIFIC chunk
+     * @return TransferResult indicating if the chunk was accepted
+     */
+    TransferResult uploadChunk(String fileName, int chunkIndex, int totalChunks, byte[] data, String checksum)
             throws RemoteException;
 
     /**
