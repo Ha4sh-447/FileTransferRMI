@@ -7,6 +7,7 @@ import java.io.*;
 import java.nio.file.*;
 import java.rmi.*;
 import java.rmi.registry.*;
+import java.rmi.server.UnicastRemoteObject;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
@@ -17,7 +18,7 @@ import java.util.zip.*;
  * Connects via Load Balancer and performs file operations with automatic
  * retry/failover.
  */
-public class FileTransferClient {
+public class FileTransferClient extends UnicastRemoteObject implements FileUpdateCallback {
 
     // ──── Configuration ────
     private static final int MAX_RETRIES = 3; // At-least-once retry count
@@ -31,9 +32,16 @@ public class FileTransferClient {
     private String currentServerUrl;
     private LoadBalancerService loadBalancer;
 
-    public FileTransferClient(String lbHost, int lbPort) {
+    public FileTransferClient(String lbHost, int lbPort) throws RemoteException {
+        super();
         this.lbHost = lbHost;
         this.lbPort = lbPort;
+    }
+
+    @Override
+    public void onFileUpdate(String message) throws RemoteException {
+        System.out.println("\n\n  [ASYNC NOTIFICATION] " + message);
+        System.out.print("  Choose option [1-8] or wait for prompt: ");
     }
 
     /**
@@ -61,6 +69,9 @@ public class FileTransferClient {
         // Verify connection with ping
         String serverName = currentServer.ping();
         System.out.println("  ✓ Connected to " + serverName);
+
+        // Register for async callbacks (Point D)
+        currentServer.registerCallback(this);
     }
 
     /**
@@ -80,20 +91,7 @@ public class FileTransferClient {
         }
     }
 
-    // ════════════════════════════════════════════════════════════
     // FILE OPERATIONS WITH RETRY LOGIC
-    // ════════════════════════════════════════════════════════════
-
-    /**
-     * Upload a file to the server with at-least-once retry semantics.
-     * 
-     * Flow:
-     * 1. Read local file
-     * 2. Compute SHA-256 checksum on raw data
-     * 3. GZIP-compress the data
-     * 4. Send via RMI with retry/failover logic
-     * 5. Verify server's checksum matches
-     */
     private void uploadFile(String localFilePath) {
         File file = new File(localFilePath);
         if (!file.exists() || !file.isFile()) {
@@ -111,17 +109,35 @@ public class FileTransferClient {
             String checksum = computeChecksum(rawData);
             System.out.println("  │ SHA-256: " + checksum);
 
-            // Compress
-            byte[] compressed = compress(rawData);
-            double ratio = (1 - (double) compressed.length / rawData.length) * 100;
-            System.out.println("  │ Compressed: " + formatSize(rawData.length)
-                    + " → " + formatSize(compressed.length)
-                    + String.format(" (%.1f%% saved)", ratio));
-            System.out.println("  │");
+            // Chunked Strategy (Point H) for reducing per-call workload
+            int chunkSize = 2 * 1024 * 1024; // 2MB
+            if (rawData.length > chunkSize) {
+                System.out.println("  │ Size > 2MB. Uploading in chunks to reduce server load...");
+                int totalChunks = (int) Math.ceil((double) rawData.length / chunkSize);
+                for (int i = 0; i < totalChunks; i++) {
+                    int startIdx = i * chunkSize;
+                    int len = Math.min(chunkSize, rawData.length - startIdx);
+                    byte[] chunkData = new byte[len];
+                    System.arraycopy(rawData, startIdx, chunkData, 0, len);
+                    String chunkCheck = computeChecksum(chunkData);
+                    final int currentI = i;
+                    // Point E: Exactly-Once for every chunk
+                    String chunkReqId = UUID.randomUUID().toString();
+                    TransferResult tr = retryOperation(
+                            () -> currentServer.uploadChunk(file.getName(), currentI, totalChunks, chunkData,
+                                    chunkCheck, chunkReqId));
+                    System.out.println("  │ [ACK/Receipt] " + tr.getReceipt().serverSignature);
+                }
+                System.out.println("  │ ✓ Upload complete!");
+                System.out.println("  └──────────────────────────────────────────────");
+                return;
+            }
 
-            // Send with retry logic
+            // Exactly-Once for small files (Point E)
+            String uploadId = UUID.randomUUID().toString();
+            byte[] compressed = compress(rawData);
             TransferResult result = retryOperation(
-                    () -> currentServer.uploadFile(file.getName(), compressed, checksum));
+                    () -> currentServer.uploadFile(file.getName(), compressed, checksum, uploadId));
 
             System.out.println("  │ " + result);
             if (result.isSuccess() && result.getChecksum() != null) {
@@ -195,8 +211,9 @@ public class FileTransferClient {
         System.out.println("\n  ┌─ DELETE ──────────────────────────────────────");
         System.out.println("  │ File: " + fileName);
 
+        String requestId = UUID.randomUUID().toString(); // Exactly-Once Semantics (Point E)
         try {
-            TransferResult result = retryOperation(() -> currentServer.deleteFile(fileName));
+            TransferResult result = retryOperation(() -> currentServer.deleteFile(fileName, requestId));
             System.out.println("  │ " + result);
             System.out.println("  └──────────────────────────────────────────────");
         } catch (Exception e) {
@@ -267,8 +284,40 @@ public class FileTransferClient {
     }
 
     /**
-     * Show all servers registered with the Load Balancer.
+     * Demonstrate Concurrent Access to Multiple Servers (Point F).
+     * Parallel query to all registered servers.
      */
+    private void parallelListAll() {
+        System.out.println("\n  ┌─ PARALLEL CLUSTER SCAN (Point F) ───────────");
+        try {
+            List<String> servers = loadBalancer.getAllServers();
+            for (String url : servers) {
+                new Thread(() -> {
+                    try {
+                        FileTransferService s = (FileTransferService) Naming.lookup(url);
+                        List<FileMetadata> files = s.listFiles();
+                        System.out.println("  │ " + url + " reporting " + files.size() + " files.");
+                    } catch (Exception ignored) {
+                    }
+                }).start();
+            }
+        } catch (Exception e) {
+            System.out.println("  │ ✗ Failed: " + e.getMessage());
+        }
+    }
+
+    private void showDiagnostics() {
+        System.out.println("\n  ┌─ SERVER DIAGNOSTICS (A & B) ───────────");
+        try {
+            ServerDiagnostics diag = currentServer.getDiagnostics();
+            System.out.println(diag);
+            System.out.println("  - Protocol Version: " + currentServer.getProtocolVersion());
+        } catch (Exception e) {
+            System.out.println("  │ ✗ Failed: " + e.getMessage());
+        }
+        System.out.println("  └────────────────────────────────────────────");
+    }
+
     private void showServers() {
         System.out.println("\n  ┌─ REGISTERED SERVERS ──────────────────────────");
         try {
@@ -289,9 +338,7 @@ public class FileTransferClient {
         }
     }
 
-    // ════════════════════════════════════════════════════════════
     // RETRY LOGIC — At-Least-Once Semantics
-    // ════════════════════════════════════════════════════════════
 
     /**
      * Functional interface for remote operations.
@@ -345,9 +392,7 @@ public class FileTransferClient {
         throw new Exception("All " + MAX_RETRIES + " retry attempts failed.", lastException);
     }
 
-    // ════════════════════════════════════════════════════════════
     // UTILITY METHODS
-    // ════════════════════════════════════════════════════════════
 
     private byte[] compress(byte[] data) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -394,9 +439,7 @@ public class FileTransferClient {
         return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
     }
 
-    // ════════════════════════════════════════════════════════════
     // INTERACTIVE CLI
-    // ════════════════════════════════════════════════════════════
 
     private void run() {
         try (Scanner scanner = new Scanner(System.in)) {
@@ -423,9 +466,11 @@ public class FileTransferClient {
                 System.out.println("  │  5. File Info");
                 System.out.println("  │  6. Show Servers");
                 System.out.println("  │  7. Switch Server");
-                System.out.println("  │  8. Exit");
+                System.out.println("  │  8. Server Diagnostics (A, B, K)");
+                System.out.println("  │  9. Parallel Cluster Scan (F)");
+                System.out.println("  │  10. Exit");
                 System.out.println("  └────────────────────────────────────────────────");
-                System.out.print("  Choose option [1-8]: ");
+                System.out.print("  Choose option [1-10]: ");
 
                 String choice = scanner.nextLine().trim();
 
@@ -472,19 +517,25 @@ public class FileTransferClient {
                         break;
 
                     case "8":
+                        showDiagnostics();
+                        break;
+
+                    case "9":
+                        parallelListAll();
+                        break;
+
+                    case "10":
                         System.out.println("  Goodbye!");
                         return;
 
                     default:
-                        System.out.println("  ✗ Invalid option. Please enter 1-8.");
+                        System.out.println("  ✗ Invalid option. Please enter 1-10.");
                 }
             }
         }
     }
 
-    // ════════════════════════════════════════════════════════════
     // MAIN
-    // ════════════════════════════════════════════════════════════
 
     /**
      * Start the interactive file transfer client.
@@ -493,10 +544,18 @@ public class FileTransferClient {
      * Defaults: localhost 1099
      */
     public static void main(String[] args) {
+        // Point J: Proper Selection of Timeout Values
+        System.setProperty("sun.rmi.transport.tcp.connectionTimeout", "3000"); // 3s connect timeout
+        System.setProperty("sun.rmi.transport.tcp.readTimeout", "5000"); // 5s read timeout
+
         String host = args.length > 0 ? args[0] : "localhost";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : 1099;
 
-        FileTransferClient client = new FileTransferClient(host, port);
-        client.run();
+        try {
+            FileTransferClient client = new FileTransferClient(host, port);
+            client.run();
+        } catch (RemoteException e) {
+            System.err.println("Fatal Error initializing client: " + e.getMessage());
+        }
     }
 }

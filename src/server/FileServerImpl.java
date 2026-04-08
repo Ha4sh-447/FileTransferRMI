@@ -12,11 +12,11 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.*;
 import java.net.*;
 import com.sun.net.httpserver.*;
-import java.util.concurrent.Executors;
 
 /**
  * Core server implementation of the Distributed File Transfer System using Java
@@ -30,8 +30,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
 
     private static final long serialVersionUID = 1L;
 
-    // ──── Configuration ────
-    private static final int REPLY_CACHE_SIZE = 100; // Max cached responses
+    private static final int REPLY_CACHE_SIZE = 100;
     private static final long CACHE_TTL_MS = 30_000; // 30-second cache TTL
     private static final String CHECKSUM_ALGO = "SHA-256";
 
@@ -41,7 +40,10 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
     private final ConcurrentHashMap<String, ReentrantLock> fileLocks;
     private final ConcurrentHashMap<String, byte[][]> activeTransfers; // fileName -> [chunkIndex][data]
     private final ReplyCache replyCache;
+    private final ReplyCache requestDeduplicationCache;
+    private final List<FileUpdateCallback> callbacks;
     private final AccessLogger logger;
+    private final long startupTime;
 
     /**
      * Create a new file server instance.
@@ -59,7 +61,10 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
         this.fileLocks = new ConcurrentHashMap<>();
         this.activeTransfers = new ConcurrentHashMap<>();
         this.replyCache = new ReplyCache(REPLY_CACHE_SIZE);
+        this.requestDeduplicationCache = new ReplyCache(500);
+        this.callbacks = new CopyOnWriteArrayList<>();
         this.logger = new AccessLogger(serverName, logDir);
+        this.startupTime = System.currentTimeMillis();
 
         // Ensure storage directory exists
         File dir = new File(storageDir);
@@ -152,7 +157,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
             throws RemoteException {
         // Validate chunk integrity
         if (!computeChecksum(data).equals(checksum)) {
-            return new TransferResult(false, "Chunk " + chunkIndex + " checksum mismatch.");
+            return new TransferResult(false, "Chunk " + chunkIndex + " checksum mismatch.", serverName);
         }
 
         byte[][] chunks = activeTransfers.computeIfAbsent(fileName, k -> new byte[totalChunks][]);
@@ -187,16 +192,30 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
                 fileMetadataMap.put(fileName, meta);
                 activeTransfers.remove(fileName);
                 replyCache.invalidateAll();
+                notifyCallbacks("File fully uploaded via chunks: " + fileName);
 
-                return new TransferResult(true, "Combined " + totalChunks + " chunks into " + fileName, fullChecksum);
+                return new TransferResult(true, "Combined " + totalChunks + " chunks into " + fileName, fullChecksum,
+                        serverName);
             } catch (IOException e) {
-                return new TransferResult(false, "Failed to merge chunks: " + e.getMessage());
+                return new TransferResult(false, "Failed to merge chunks: " + e.getMessage(), serverName);
             } finally {
                 lock.unlock();
             }
         }
 
-        return new TransferResult(true, "Chunk " + chunkIndex + " received.");
+        return new TransferResult(true, "Chunk " + chunkIndex + " received.", serverName);
+    }
+
+    @Override
+    public TransferResult uploadChunk(String fileName, int chunkIndex, int totalChunks, byte[] data, String checksum,
+            String requestId) throws RemoteException {
+        Object cached = requestDeduplicationCache.get("CHUNK:" + requestId, 300_000);
+        if (cached != null)
+            return (TransferResult) cached;
+
+        TransferResult res = uploadChunk(fileName, chunkIndex, totalChunks, data, checksum);
+        requestDeduplicationCache.put("CHUNK:" + requestId, res);
+        return res;
     }
 
     private void loadExistingFiles() {
@@ -228,9 +247,18 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
         return fileLocks.computeIfAbsent(fileName, k -> new ReentrantLock());
     }
 
-    // ════════════════════════════════════════════════════════════
+    private void notifyCallbacks(String message) {
+        for (FileUpdateCallback cb : callbacks) {
+            try {
+                cb.onFileUpdate("[" + serverName + "] " + message);
+            } catch (RemoteException e) {
+                // Client disconnected/failed, remove it
+                callbacks.remove(cb);
+            }
+        }
+    }
+
     // REMOTE METHOD IMPLEMENTATIONS
-    // ════════════════════════════════════════════════════════════
 
     /**
      * Upload a file to this server.
@@ -265,7 +293,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
             String serverChecksum = computeChecksum(rawData);
             if (!serverChecksum.equals(clientChecksum)) {
                 logger.logFailure("UPLOAD", fileName, "Checksum mismatch!");
-                return new TransferResult(false, "Checksum verification failed.");
+                return new TransferResult(false, "Checksum verification failed.", serverName);
             }
 
             // Step 3: Write to storage
@@ -280,15 +308,29 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
 
             // Step 5: Invalidate cache
             replyCache.invalidateAll();
+            notifyCallbacks("File uploaded: " + fileName);
 
             logger.logSuccess("UPLOAD", fileName, "Completed");
-            return new TransferResult(true, "File '" + fileName + "' uploaded to " + serverName, serverChecksum);
+            return new TransferResult(true, "File '" + fileName + "' uploaded to " + serverName, serverChecksum,
+                    serverName);
         } catch (IOException e) {
             logger.logFailure("UPLOAD", fileName, e.getMessage());
-            return new TransferResult(false, "Server IO Error: " + e.getMessage());
+            return new TransferResult(false, "Server IO Error: " + e.getMessage(), serverName);
         } finally {
             lock.unlock();
         }
+    }
+
+    @Override
+    public TransferResult uploadFile(String fileName, byte[] compressedData, String checksum, String requestId)
+            throws RemoteException {
+        Object cached = requestDeduplicationCache.get("UPLOAD:" + requestId, 300_000);
+        if (cached != null)
+            return (TransferResult) cached;
+
+        TransferResult res = uploadFile(fileName, compressedData, checksum);
+        requestDeduplicationCache.put("UPLOAD:" + requestId, res);
+        return res;
     }
 
     /**
@@ -350,17 +392,49 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
             replyCache.invalidateAll();
 
             if (existed) {
+                notifyCallbacks("File deleted: " + fileName);
                 logger.logSuccess("DELETE", fileName, "Deleted from storage");
-                return new TransferResult(true, "File '" + fileName + "' deleted successfully.");
+                return new TransferResult(true, "File '" + fileName + "' deleted successfully.", serverName);
             } else {
-                return new TransferResult(true, "File '" + fileName + "' not found (idempotent).");
+                return new TransferResult(true, "File '" + fileName + "' not found (idempotent).", serverName);
             }
         } catch (IOException e) {
             logger.logFailure("DELETE", fileName, e.getMessage());
-            return new TransferResult(false, "Delete failed: " + e.getMessage());
+            return new TransferResult(false, "Delete failed: " + e.getMessage(), serverName);
         } finally {
             lock.unlock();
         }
+    }
+
+    @Override
+    public TransferResult deleteFile(String fileName, String requestId) throws RemoteException {
+        // Exactly-Once deduplication check
+        Object cachedResult = requestDeduplicationCache.get("REQ:" + requestId, 600_000); // 10 min TTL
+        if (cachedResult != null) {
+            logger.log("DELETE", fileName, "Duplicate request " + requestId + " served from cache (Exactly-Once)");
+            return (TransferResult) cachedResult;
+        }
+
+        // Perform actual delete
+        TransferResult result = deleteFile(fileName);
+
+        // Cache result for future duplicates
+        requestDeduplicationCache.put("REQ:" + requestId, result);
+        return result;
+    }
+
+    @Override
+    public void registerCallback(FileUpdateCallback callback) throws RemoteException {
+        if (!callbacks.contains(callback)) {
+            callbacks.add(callback);
+            logger.log("CALLBACK", "---", "Client registered for notifications");
+        }
+    }
+
+    @Override
+    public void unregisterCallback(FileUpdateCallback callback) throws RemoteException {
+        callbacks.remove(callback);
+        logger.log("CALLBACK", "---", "Client unregistered from notifications");
     }
 
     /**
@@ -428,9 +502,22 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
         return serverName;
     }
 
-    // ════════════════════════════════════════════════════════════
+    @Override
+    public String getProtocolVersion() throws RemoteException {
+        return TransferResult.PROTOCOL_VERSION;
+    }
+
+    @Override
+    public ServerDiagnostics getDiagnostics() throws RemoteException {
+        return new ServerDiagnostics(
+                serverName,
+                startupTime,
+                true, // Stateless: True
+                0, // No session maps
+                "Persistent UnicastRemoteObject (Registry-Bound)");
+    }
+
     // UTILITY METHODS — Compression & Checksums
-    // ════════════════════════════════════════════════════════════
 
     /**
      * GZIP-compress a byte array.
@@ -478,9 +565,7 @@ public class FileServerImpl extends UnicastRemoteObject implements FileTransferS
         }
     }
 
-    // ════════════════════════════════════════════════════════════
     // MAIN — Server Startup
-    // ════════════════════════════════════════════════════════════
 
     /**
      * Start a file server instance and register it with the RMI registry.

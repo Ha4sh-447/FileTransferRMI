@@ -81,8 +81,9 @@ public class LoadBalancer extends UnicastRemoteObject implements LoadBalancerSer
 
         ServerEndpoint ep = new ServerEndpoint(host, port, bindName);
         servers.add(ep);
+        String role = (servers.size() == 1) ? "PRIMARY" : "BACKUP (Failover Node)";
         System.out.println("  ✓ Server registered: " + ep.getFullAddress()
-                + "  (Total: " + servers.size() + ")");
+                + " [" + role + "] (Total: " + servers.size() + ")");
     }
 
     /**
